@@ -62,6 +62,15 @@ jobs:
         shell: bash
         run: python3 tools/check_consistency.py
 
+      - name: Obfuscate strings
+        shell: bash
+        run: |
+          if [ -f tools/obfuscate-strings.py ]; then
+            python3 tools/obfuscate-strings.py
+          else
+            echo "obfuscate-strings.py tidak ada, lewati"
+          fi
+
       - name: Fix gradlew permissions
         shell: bash
         run: chmod +x ./gradlew
