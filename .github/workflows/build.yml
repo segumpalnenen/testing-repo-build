@@ -1,0 +1,180 @@
+name: Build
+
+on:
+  repository_dispatch:
+    types: [build]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Commit SHA source (kosongkan = main terbaru)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: builds
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source (repo private)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SOURCE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ github.event.client_payload.sha || github.event.inputs.sha || 'main' }}
+
+      - name: Info build
+        shell: bash
+        run: |
+          echo "Commit: $(git rev-parse --short HEAD)"
+          echo "Dipicu oleh: ${{ github.event_name }}"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Check Android SDK
+        shell: bash
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          D8=$(ls -d "$ANDROID_HOME"/build-tools/*/d8 2>/dev/null | sort -r | head -n 1)
+          JAR=$(ls -d "$ANDROID_HOME"/platforms/android-*/android.jar 2>/dev/null | sort -r | head -n 1)
+          if [ -z "$D8" ] || [ -z "$JAR" ]; then
+            echo "d8 atau android.jar tidak ditemukan"
+            ls "$ANDROID_HOME/build-tools" 2>/dev/null || true
+            ls "$ANDROID_HOME/platforms" 2>/dev/null || true
+            exit 1
+          fi
+          echo "d8: $D8"
+          echo "android.jar: $JAR"
+
+      - name: Consistency check
+        shell: bash
+        run: python3 tools/check_consistency.py
+
+      - name: Obfuscate strings
+        shell: bash
+        run: |
+          if [ -f tools/obfuscate-strings.py ]; then
+            python3 tools/obfuscate-strings.py
+          else
+            echo "obfuscate-strings.py tidak ada, lewati"
+          fi
+
+      - name: Fix gradlew permissions
+        shell: bash
+        run: chmod +x ./gradlew
+
+      - name: Build release classes
+        shell: bash
+        run: |
+          set -eo pipefail
+          ./gradlew --no-daemon --stacktrace clean assembleRelease 2>&1 | tee build.log
+
+      - name: Show error summary
+        if: failure()
+        shell: bash
+        run: |
+          echo "===================== ERROR SUMMARY ======================"
+          grep -aE "^e: |^error:|FAILED$|FAILED |Caused by:|\* What went wrong|\* Exception is" build.log | head -40 || true
+          echo ""
+          echo "===================== LOG TAIL ======================"
+          tail -n 100 build.log || true
+          echo ""
+          echo "===================== BUILD OUTPUTS ======================"
+          for dir in */; do
+            if [ -f "$dir/build.gradle.kts" ]; then
+              echo "--- $dir ---"
+              find "$dir/build" -maxdepth 4 -type d 2>/dev/null | head -20 || true
+            fi
+          done
+
+      - name: Package plugins (.aks)
+        shell: bash
+        run: |
+          set -e
+          COUNT=0
+          for dir in */; do
+            if [ -f "$dir/build.gradle.kts" ] && grep -q "pluginClass" "$dir/build.gradle.kts"; then
+              PLUGIN="${dir%/}"
+              echo "=== $PLUGIN ==="
+              python3 tools/package_aks.py "$PLUGIN"
+              COUNT=$((COUNT + 1))
+            fi
+          done
+          echo "Dipaket: $COUNT plugin"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Tidak ada plugin ditemukan"
+            exit 1
+          fi
+          ls -la builds/
+
+      - name: Generate manifests
+        shell: bash
+        run: python3 tools/generate_manifests.py
+
+      - name: Verify outputs
+        shell: bash
+        run: |
+          set -e
+          test -f builds/plugins.json
+          test -f builds/repo.json
+          COUNT=$(ls builds/*.aks | wc -l)
+          MANIFEST_COUNT=$(python3 -c "import json; print(len(json.load(open('builds/plugins.json'))))")
+          echo "File .aks: $COUNT, entri plugins.json: $MANIFEST_COUNT"
+          if [ "$MANIFEST_COUNT" -ne "$COUNT" ]; then
+            echo "plugins.json tidak cocok dengan jumlah .aks"
+            exit 1
+          fi
+          BANNED="aku""shukai"
+          if grep -ri "$BANNED" builds/*.json; then
+            echo "Manifest mengandung nama terlarang"
+            exit 1
+          fi
+          ls -la builds/
+
+      - name: Checkout public repo (workspace)
+        uses: actions/checkout@v4
+        with:
+          path: public
+          fetch-depth: 0
+
+      - name: Publish to Codeberg
+        shell: bash
+        env:
+          CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+        run: |
+          set -e
+          cd public
+          git config user.name "echolocation"
+          git config user.email "echolocation@noreply.codeberg.org"
+          git remote add codeberg "https://x-access-token:${CODEBERG_TOKEN}@codeberg.org/5glte10kbps/echolocation.git"
+          git fetch codeberg main 2>/dev/null || true
+          if git show-ref --verify --quiet refs/remotes/codeberg/main; then
+            git checkout -B main codeberg/main
+          else
+            git checkout --orphan main
+            git rm -rf . 2>/dev/null || true
+          fi
+          rm -f *.aks *.json
+          cp ../builds/*.aks ../builds/plugins.json ../builds/repo.json .
+          if [ -d ../assets ]; then cp ../assets/* . 2>/dev/null || true; fi
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Tidak ada perubahan di main, lewati commit."
+          else
+            SHORT_SHA=$(git -C .. rev-parse --short HEAD)
+            git commit -m "Build ${{ github.run_number }} ($SHORT_SHA)"
+          fi
+          git push codeberg main
+          echo "Publish ke Codeberg selesai."
